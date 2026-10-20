@@ -35,24 +35,26 @@ Make sure Tampermonkey is allowed to run userscripts in your browser.
 
 ### Step 5: Add Your School's Schoology Link
 
-You need to configure the script to work on your school's Schoology website.
-
 1. Open your school's Schoology homepage.
 2. Copy the website address from your browser's address bar.
 3. Return to the Tampermonkey script editor.
 4. Find the `@match` line near the top of the script.
 
-It should look similar to this:
+It should look like this:
 
 ```javascript
 // @match      *(YOUR SCHOOLOGY HOME LINK)*
 ```
 
-Replace the placeholder with your school's actual Schoology website address, following the format required by the script.
+5. Replace `YOUR SCHOOLOGY HOME LINK` with your school's actual Schoology link. **Keep the `*` at both the start and end of the link.**
 
-**Example:** If your school uses `https://schoolname.schoology.com/`, make sure the `@match` line matches that website.
+**Example:**
 
-Do not copy the example unless it matches your school's actual address.
+```javascript
+// @match      *https://schoolname.schoology.com/*
+```
+
+Make sure you use your own school's link instead of the example. Save the script when you're finished.
 
 ### Step 6: Save the Script
 
