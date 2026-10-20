@@ -1,4 +1,4 @@
-# Schoology-Close-Overdue-Assignments
+# Schoology Close Overdue Assignments
 
 A simple userscript for Schoology that helps you close overdue assignments using a keyboard shortcut.
 
