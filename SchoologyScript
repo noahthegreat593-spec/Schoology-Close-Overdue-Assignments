@@ -1,0 +1,674 @@
+// ==UserScript==
+// @name         Schoology Overdue Hider
+// @namespace    schoology-overdue-hider
+// @version      12.0.0
+// @description  Hide individual overdue assignments on Schoology and bring them back any time. Press / . , to open the manager.
+// @match        *(YOUR SCHOOLOGY LINK HERE)*
+// @run-at       document-end
+// @grant        none
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    const STORE = 'soh-hidden-v6';          // same key as before, so everything you hid is kept
+    const SETTINGS = 'soh-settings-v2';
+
+    // ================= saved data =================
+    const loadHidden = () => {
+        try {
+            const a = JSON.parse(localStorage.getItem(STORE) || '[]');
+            return new Set(Array.isArray(a) ? a.filter(k => typeof k === 'string') : []);
+        } catch (e) { return new Set(); }
+    };
+    let hidden = loadHidden();
+    const saveHidden = () => {
+        try { localStorage.setItem(STORE, JSON.stringify([...hidden])); } catch (e) {}
+    };
+
+    const settings = { x: null, y: null, hideLink: true, corner: true };
+    for (const k of ['soh-settings-v1', SETTINGS]) {
+        try {
+            const s = JSON.parse(localStorage.getItem(k) || '{}');
+            for (const f of Object.keys(settings)) if (f in s) settings[f] = s[f];
+        } catch (e) {}
+    }
+    const saveSettings = () => {
+        try { localStorage.setItem(SETTINGS, JSON.stringify(settings)); } catch (e) {}
+    };
+
+    // ================= identifying an assignment =================
+    // An assignment is identified by title + course + due day. That identity is the same
+    // wherever the assignment shows up (sidebar, popup, refreshed list), so hiding and
+    // restoring always agree with each other.
+    const norm = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const cleanTitle = s => (s || '')
+        .replace(/^\s*Assignment\.?\s*/i, '')
+        .replace(/\s*\d+\s*days?\s*overdu?e?.*$/i, '')
+        .replace(/\s+/g, ' ').trim();
+    const cleanCourse = s => (s || '').split(' : ')[0].replace(/\s+/g, ' ').trim();
+    const pad = n => String(n).padStart(2, '0');
+    const dayOf = start => {
+        if (!start) return '';
+        const d = new Date(start * 1000);
+        return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+    };
+    const sameCourse = (a, b) => !a || !b || norm(a) === norm(b);
+
+    function parseKey(key) {
+        const [start, title, course] = key.split('|');
+        const s = parseInt(start, 10) || 0;
+        return {
+            key,
+            start: s,
+            day: dayOf(s),
+            title: cleanTitle(title || '') || '(untitled)',
+            course: cleanCourse(course || ''),
+            due: s ? new Date(s * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }) : ''
+        };
+    }
+
+    // index of hidden assignments, for fast "is this one hidden?" checks
+    let index = new Map();
+    function rebuildIndex() {
+        index = new Map();
+        hidden.forEach(k => {
+            const p = parseKey(k);
+            const id = norm(p.title) + '|' + p.day;
+            if (!index.has(id)) index.set(id, []);
+            index.get(id).push(p);
+        });
+    }
+    rebuildIndex();
+
+    const matches = info =>
+        (index.get(norm(info.title) + '|' + info.day) || []).filter(p => sameCourse(p.course, info.course));
+
+    function infoFor(n) {
+        let t = '';
+        const te = n.querySelector('.readonly-title.event-title');
+        if (te) t = te.textContent;
+        else { const a = n.querySelector('a[href]'); t = a ? a.textContent : n.textContent; }
+        const title = cleanTitle(t);
+
+        let course = '';
+        const subs = [...n.querySelectorAll('.event-subtitle')]
+            .map(x => x.textContent.trim()).filter(x => x && !/\boverdue\b|\bdue\b/i.test(x));
+        if (subs.length) course = subs[subs.length - 1];
+        else { const r = n.querySelector('.realm-title-course'); if (r) course = r.textContent; }
+        course = cleanCourse(course);
+
+        let start = parseInt(n.getAttribute('data-start'), 10) || 0;
+        if (!start) {
+            const m = n.textContent.match(/due on\s+(.+?)\s+at\s+(\d{1,2}:\d{2}\s*[ap]m)/i);
+            if (m) {
+                const d = new Date(m[1].replace(/^[A-Za-z]+,\s*/, '') + ' ' + m[2]);
+                if (!isNaN(d)) start = Math.floor(d / 1000);
+            }
+        }
+        return {
+            title, course, start, day: dayOf(start),
+            key: [start || '', title.replace(/\|/g, '/'), course.replace(/\|/g, '/')].join('|')
+        };
+    }
+
+    const isOverdue = n =>
+        !!n.querySelector('.submission-infotip, img[alt^="Overdue"]') || /overdue/i.test(n.textContent);
+
+    // ================= hide / restore =================
+    function commit() {
+        saveHidden();
+        rebuildIndex();
+        applyAll();
+    }
+
+    function hideKeys(keys) {
+        keys.forEach(k => hidden.add(k));
+        commit();
+    }
+
+    // Restores the given assignments, plus any other saved entry for the same assignment.
+    function unhide(keys) {
+        const gone = new Set();
+        keys.forEach(k => {
+            gone.add(k);
+            matches(parseKey(k)).forEach(p => gone.add(p.key));
+        });
+        const removed = [...gone].filter(k => hidden.has(k));
+        removed.forEach(k => hidden.delete(k));
+        commit();
+        return removed;
+    }
+
+    // ================= icons =================
+    const svg = p => `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+    const ICON_RESTORE = svg('<polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>');
+    const ICON_CLOSE = svg('<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>');
+    const ICON_SEARCH = svg('<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>');
+
+    // ================= styles =================
+    const style = document.createElement('style');
+    style.textContent = `
+      [data-soh-hidden="1"] { display: none !important; }
+      body.soh-show-all [data-soh-hidden="1"] { display: block !important; opacity: .4 !important; }
+      [data-soh-item] { position: relative !important; padding-left: 56px !important; }
+      body.soh-hide-more a[href*="overdue-popup"], body.soh-hide-more [data-soh-more] { display: none !important; }
+
+      .soh-btn {
+        position: absolute !important; left: 6px; top: 50%; transform: translateY(-50%); z-index: 50;
+        padding: 2px 10px; cursor: pointer; border-radius: 999px;
+        font: 600 11px/1.5 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+        color: #5b6270; background: #fff; border: 1px solid #cfd3da;
+        transition: color .12s, border-color .12s, background .12s;
+      }
+      .soh-btn:hover { color: #d03a2f; border-color: #d03a2f; background: #fff1ef; }
+      body.soh-show-all .soh-btn:hover { color: #1f7a45; border-color: #1f7a45; background: #eefaf2; }
+
+      #soh-panel, #soh-toast, #soh-corner {
+        --bg: #ffffff; --bg2: #f6f7f9; --fg: #1c2024; --mut: #6b7280; --line: #e4e7ec;
+        --acc: #2f6df6; --acc-fg: #fff; --shadow: 0 18px 50px rgba(15,23,42,.28);
+        font: 13px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        color: var(--fg); box-sizing: border-box;
+      }
+      @media (prefers-color-scheme: dark) {
+        #soh-panel, #soh-toast, #soh-corner {
+          --bg: #1b1e24; --bg2: #242830; --fg: #e8eaee; --mut: #9aa3b2; --line: #333945;
+          --acc: #6c9bff; --acc-fg: #0d1117;
+        }
+        .soh-btn { background: #1b1e24; color: #a5acb9; border-color: #4a5160; }
+        .soh-btn:hover { background: #3a2523; }
+      }
+      #soh-panel *, #soh-toast * { box-sizing: border-box; }
+      #soh-panel button, #soh-toast button { font: inherit; color: inherit; }
+
+      #soh-corner {
+        position: fixed; right: 14px; bottom: 14px; z-index: 2147483646; display: none;
+        padding: 5px 12px; border: 1px solid var(--line); border-radius: 999px; cursor: pointer;
+        background: var(--bg); color: var(--mut); font-weight: 600; font-size: 12px;
+        box-shadow: 0 2px 10px rgba(0,0,0,.18); opacity: .8;
+      }
+      #soh-corner:hover { opacity: 1; color: var(--fg); }
+      #soh-corner.show { display: block; }
+
+      #soh-panel {
+        position: fixed; right: 18px; bottom: 18px; z-index: 2147483647;
+        width: 360px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px);
+        display: none; flex-direction: column;
+        background: var(--bg); border: 1px solid var(--line); border-radius: 14px;
+        box-shadow: var(--shadow); overflow: hidden;
+      }
+      #soh-panel.open { display: flex; animation: soh-pop .14s ease-out; }
+      @keyframes soh-pop { from { opacity: 0; transform: translateY(8px) scale(.98); } to { opacity: 1; transform: none; } }
+
+      #soh-panel .soh-head {
+        display: flex; align-items: center; gap: 8px; padding: 12px 12px 12px 14px;
+        cursor: grab; user-select: none; border-bottom: 1px solid var(--line);
+      }
+      #soh-panel .soh-head:active { cursor: grabbing; }
+      #soh-panel .soh-title { font-weight: 650; font-size: 14px; flex: 1; }
+      #soh-panel .soh-badge {
+        background: var(--acc); color: var(--acc-fg); border-radius: 999px; padding: 1px 10px; font-size: 12px; font-weight: 700;
+      }
+      #soh-panel .soh-iconbtn {
+        display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px;
+        border: 0; background: none; border-radius: 7px; cursor: pointer; color: var(--mut);
+      }
+      #soh-panel .soh-iconbtn:hover { background: var(--bg2); color: var(--fg); }
+
+      #soh-panel .soh-intro { padding: 10px 14px 0; color: var(--mut); font-size: 12px; }
+      #soh-panel .soh-search { position: relative; margin: 10px 12px 4px; }
+      #soh-panel .soh-search svg { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--mut); }
+      #soh-panel .soh-search input {
+        width: 100%; padding: 8px 10px 8px 30px; background: var(--bg2); color: var(--fg);
+        border: 1px solid var(--line); border-radius: 9px; outline: none; font: inherit;
+      }
+      #soh-panel .soh-search input:focus { border-color: var(--acc); }
+
+      #soh-panel .soh-list { overflow: auto; padding: 4px 12px 10px; min-height: 80px; flex: 1; }
+      #soh-panel .soh-course {
+        margin: 10px 2px 4px; font-size: 11px; font-weight: 700; letter-spacing: .04em;
+        text-transform: uppercase; color: var(--mut);
+      }
+      #soh-panel .soh-row {
+        display: flex; align-items: center; gap: 8px; padding: 8px 10px; margin-bottom: 4px;
+        border: 1px solid var(--line); border-radius: 9px; background: var(--bg);
+      }
+      #soh-panel .soh-row > div { flex: 1; min-width: 0; }
+      #soh-panel .soh-row strong, #soh-panel .soh-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #soh-panel .soh-row small { color: var(--mut); font-size: 11.5px; }
+      #soh-panel .soh-restore {
+        display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--acc); background: none;
+        color: var(--acc); border-radius: 7px; padding: 4px 9px; cursor: pointer; font-size: 12px; font-weight: 600; flex: none;
+      }
+      #soh-panel .soh-restore:hover { background: var(--acc); color: var(--acc-fg); }
+      #soh-panel .soh-empty { text-align: center; color: var(--mut); padding: 26px 12px; }
+      #soh-panel .soh-empty b { display: block; color: var(--fg); font-size: 14px; margin-bottom: 4px; }
+
+      #soh-panel .soh-foot { border-top: 1px solid var(--line); padding: 10px 12px; display: flex; flex-direction: column; gap: 9px; background: var(--bg2); }
+      #soh-panel .soh-big {
+        width: 100%; padding: 9px; border: 0; border-radius: 9px; cursor: pointer; font-weight: 700; font-size: 13px;
+        background: var(--acc); color: var(--acc-fg);
+      }
+      #soh-panel .soh-big:disabled { opacity: .45; cursor: default; }
+      #soh-panel .soh-switch { display: flex; align-items: center; justify-content: space-between; cursor: pointer; gap: 10px; }
+      #soh-panel .soh-switch small { display: block; color: var(--mut); font-size: 11px; }
+      #soh-panel .soh-switch input { position: absolute; opacity: 0; pointer-events: none; }
+      #soh-panel .soh-track { width: 34px; height: 20px; border-radius: 999px; background: var(--line); position: relative; transition: background .15s; flex: none; }
+      #soh-panel .soh-track::after {
+        content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+        border-radius: 50%; background: #fff; transition: transform .15s; box-shadow: 0 1px 3px rgba(0,0,0,.3);
+      }
+      #soh-panel .soh-switch input:checked + .soh-track { background: var(--acc); }
+      #soh-panel .soh-switch input:checked + .soh-track::after { transform: translateX(14px); }
+      #soh-panel .soh-switch input:focus-visible + .soh-track { outline: 2px solid var(--acc); outline-offset: 2px; }
+      #soh-panel details summary { cursor: pointer; color: var(--mut); font-size: 12px; }
+      #soh-panel .soh-backup { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+      #soh-panel .soh-backup .soh-actions { display: flex; gap: 6px; }
+      #soh-panel .soh-small {
+        flex: 1; padding: 6px 8px; border: 1px solid var(--line); background: var(--bg); border-radius: 8px;
+        cursor: pointer; font-size: 12px; font-weight: 600;
+      }
+      #soh-panel .soh-small:hover { border-color: var(--acc); color: var(--acc); }
+      #soh-panel textarea {
+        width: 100%; height: 60px; resize: vertical; padding: 7px; font: 11.5px/1.3 ui-monospace, Menlo, Consolas, monospace;
+        background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; outline: none;
+      }
+      #soh-panel .soh-hint { color: var(--mut); font-size: 11.5px; text-align: center; }
+      #soh-panel kbd {
+        background: var(--bg); border: 1px solid var(--line); border-bottom-width: 2px;
+        border-radius: 5px; padding: 0 5px; font: inherit; font-size: 11px;
+      }
+
+      #soh-toast {
+        position: fixed; left: 50%; bottom: 24px; z-index: 2147483647;
+        transform: translate(-50%, 20px); opacity: 0; pointer-events: none;
+        display: flex; align-items: center; gap: 12px; max-width: min(92vw, 460px);
+        background: #1f2937; color: #f3f4f6; padding: 10px 14px; border-radius: 10px;
+        box-shadow: var(--shadow); transition: opacity .18s, transform .18s;
+      }
+      #soh-toast.show { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+      #soh-toast span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #soh-toast button {
+        border: 0; background: none; color: #8ab4ff; font-weight: 700; cursor: pointer; padding: 2px 4px; flex: none;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+
+    // ================= toast =================
+    let toastEl, toastTimer;
+    function toast(msg, onUndo) {
+        if (!toastEl) {
+            toastEl = document.createElement('div');
+            toastEl.id = 'soh-toast';
+            document.body.appendChild(toastEl);
+        }
+        toastEl.textContent = '';
+        const s = document.createElement('span');
+        s.textContent = msg;
+        toastEl.appendChild(s);
+        if (onUndo) {
+            const u = document.createElement('button');
+            u.type = 'button';
+            u.textContent = 'Undo';
+            u.addEventListener('click', () => { toastEl.classList.remove('show'); onUndo(); });
+            toastEl.appendChild(u);
+        }
+        requestAnimationFrame(() => toastEl.classList.add('show'));
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => toastEl.classList.remove('show'), 6000);
+    }
+
+    // ================= assignments on the page =================
+    const infos = new WeakMap();   // item element -> latest info
+
+    function applyState(item) {
+        const info = infos.get(item);
+        if (!info) return;
+        const on = matches(info).length > 0;
+        if (on) item.setAttribute('data-soh-hidden', '1');
+        else item.removeAttribute('data-soh-hidden');
+        const b = item.querySelector(':scope > .soh-btn');
+        if (b) {
+            b.textContent = on ? 'Show' : 'Hide';
+            b.title = on ? 'Bring this assignment back' : 'Hide this assignment';
+        }
+    }
+
+    function applyAll() {
+        document.querySelectorAll('[data-soh-item]').forEach(applyState);
+        refreshUI();
+    }
+
+    function onItemButton(item) {
+        const info = infos.get(item);
+        if (!info) return;
+        const found = matches(info);
+        if (found.length) {
+            unhide(found.map(p => p.key));
+        } else {
+            hideKeys([info.key]);
+            toast('Hidden “' + info.title + '”', () => unhide([info.key]));
+        }
+    }
+
+    function scan() {
+        // the "N more overdue" link
+        document.body.classList.toggle('soh-hide-more', !!settings.hideLink);
+        document.querySelectorAll('a[href*="overdue-popup"]').forEach(a => {
+            const p = a.parentElement;
+            if (p && p !== document.body && p.textContent.trim() === a.textContent.trim()) {
+                if (settings.hideLink) p.setAttribute('data-soh-more', '1');
+                else p.removeAttribute('data-soh-more');
+            }
+        });
+
+        // every overdue assignment: keep its hide button and hidden state in sync
+        document.querySelectorAll('.upcoming-event').forEach(item => {
+            if (!isOverdue(item)) return;
+            const info = infoFor(item);
+            infos.set(item, info);
+            if (item.getAttribute('data-soh-item') !== info.key) item.setAttribute('data-soh-item', info.key);
+
+            if (!item.querySelector(':scope > .soh-btn')) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'soh-btn';
+                btn.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); onItemButton(item); });
+                item.appendChild(btn);
+            }
+            applyState(item);
+        });
+    }
+
+    // ================= panel =================
+    let panel, corner, ui = {}, lastSig = '';
+
+    function makePanel() {
+        corner = document.createElement('button');
+        corner.id = 'soh-corner';
+        corner.type = 'button';
+        corner.title = 'Open the Overdue Hider (or press / . ,)';
+        corner.addEventListener('click', openPanel);
+        document.body.appendChild(corner);
+
+        panel = document.createElement('div');
+        panel.id = 'soh-panel';
+        panel.setAttribute('role', 'dialog');
+        panel.setAttribute('aria-label', 'Hidden assignments');
+        panel.innerHTML = `
+          <div class="soh-head" data-drag>
+            <span class="soh-title">Hidden assignments</span>
+            <span class="soh-badge" data-count>0</span>
+            <button class="soh-iconbtn" type="button" data-a="close" title="Close (Esc)">${ICON_CLOSE}</button>
+          </div>
+          <div class="soh-intro">These are hidden from your overdue list. Press <b>Restore</b> to bring one back.</div>
+          <div class="soh-search">${ICON_SEARCH}<input type="text" placeholder="Search" data-search></div>
+          <div class="soh-list" data-list></div>
+          <div class="soh-foot">
+            <button class="soh-big" type="button" data-a="restore-all" data-restore-all>Restore all</button>
+            <label class="soh-switch"><span>Show hidden items on the page<small>Faded, with a “Show” button to restore</small></span>
+              <input type="checkbox" data-peek><span class="soh-track"></span></label>
+            <label class="soh-switch"><span>Hide the “more overdue” link</span>
+              <input type="checkbox" data-hidelink><span class="soh-track"></span></label>
+            <label class="soh-switch"><span>Corner button when something is hidden</span>
+              <input type="checkbox" data-corner><span class="soh-track"></span></label>
+            <details><summary>Backup</summary>
+              <div class="soh-backup">
+                <div class="soh-actions">
+                  <button class="soh-small" type="button" data-a="export">Export</button>
+                  <button class="soh-small" type="button" data-a="import">Import</button>
+                </div>
+                <textarea placeholder="To import, paste a backup here, then press Import again" data-import spellcheck="false"></textarea>
+              </div>
+            </details>
+            <div class="soh-hint"><kbd>/</kbd> <kbd>.</kbd> <kbd>,</kbd> open or close · <kbd>Esc</kbd> close</div>
+          </div>`;
+        document.body.appendChild(panel);
+
+        ui.count = panel.querySelector('[data-count]');
+        ui.list = panel.querySelector('[data-list]');
+        ui.search = panel.querySelector('[data-search]');
+        ui.restoreAll = panel.querySelector('[data-restore-all]');
+        ui.peek = panel.querySelector('[data-peek]');
+        ui.hideLink = panel.querySelector('[data-hidelink]');
+        ui.corner = panel.querySelector('[data-corner]');
+        ui.importText = panel.querySelector('[data-import]');
+
+        ui.hideLink.checked = !!settings.hideLink;
+        ui.corner.checked = !!settings.corner;
+
+        ui.search.addEventListener('input', () => renderList(true));
+        ui.peek.addEventListener('change', () => document.body.classList.toggle('soh-show-all', ui.peek.checked));
+        ui.hideLink.addEventListener('change', () => { settings.hideLink = ui.hideLink.checked; saveSettings(); scan(); });
+        ui.corner.addEventListener('change', () => { settings.corner = ui.corner.checked; saveSettings(); refreshUI(); });
+        panel.addEventListener('click', onPanelClick);
+        setupDrag(panel.querySelector('[data-drag]'));
+        window.addEventListener('resize', () => { if (settings.x !== null) place(settings.x, settings.y); });
+    }
+
+    function onPanelClick(e) {
+        e.stopPropagation();   // keep Schoology's own click handlers out of our panel
+        const t = e.target.closest('[data-a], [data-restore]');
+        if (!t) return;
+
+        if (t.dataset.restore) {
+            const removed = unhide([t.dataset.restore]);
+            if (removed.length) toast('Restored “' + parseKey(removed[0]).title + '”', () => hideKeys(removed));
+            return;
+        }
+
+        switch (t.dataset.a) {
+            case 'close': closePanel(); break;
+            case 'restore-all': {
+                if (!hidden.size) break;
+                const removed = unhide([...hidden]);
+                toast('Restored ' + removed.length + ' assignment' + (removed.length === 1 ? '' : 's') + '.', () => hideKeys(removed));
+                break;
+            }
+            case 'export': doExport(); break;
+            case 'import': doImport(); break;
+        }
+    }
+
+    function doExport() {
+        const text = JSON.stringify({ app: 'schoology-overdue-hider', version: 1, hidden: [...hidden] });
+        const fallback = () => {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+            a.download = 'schoology-hidden-backup.json';
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+            toast('Backup downloaded.');
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(() => toast('Backup copied to clipboard.'), fallback);
+        } else fallback();
+    }
+
+    function doImport() {
+        const raw = ui.importText.value.trim();
+        if (!raw) { ui.importText.focus(); toast('Paste a backup into the box first.'); return; }
+        try {
+            let data = JSON.parse(raw);
+            if (data && !Array.isArray(data)) data = data.hidden;
+            if (!Array.isArray(data)) throw new Error('bad');
+            const add = data.filter(k => typeof k === 'string' && k.length < 500 && !hidden.has(k));
+            hideKeys(add);
+            ui.importText.value = '';
+            toast('Imported ' + add.length + ' assignment' + (add.length === 1 ? '' : 's') + '.');
+        } catch (e) {
+            toast('That doesn’t look like a valid backup.');
+        }
+    }
+
+    function renderList(force) {
+        if (!panel || !panel.classList.contains('open')) return;
+        const q = ui.search.value.trim().toLowerCase();
+        const sig = [...hidden].sort().join('\n') + '#' + q;
+        if (!force && sig === lastSig) return;
+        lastSig = sig;
+
+        const groups = new Map();
+        [...hidden].map(parseKey).forEach(p => {
+            if (q && !(p.title + ' ' + p.course).toLowerCase().includes(q)) return;
+            const c = p.course || 'Other';
+            if (!groups.has(c)) groups.set(c, []);
+            groups.get(c).push(p);
+        });
+
+        ui.list.textContent = '';
+        if (!groups.size) {
+            const d = document.createElement('div');
+            d.className = 'soh-empty';
+            const b = document.createElement('b');
+            b.textContent = hidden.size ? 'No matches' : 'Nothing is hidden';
+            d.append(b, hidden.size ? 'Try a different search.' : 'Use the Hide button next to an overdue assignment.');
+            ui.list.appendChild(d);
+            return;
+        }
+
+        [...groups.keys()].sort((a, b) => a.localeCompare(b)).forEach(course => {
+            const label = document.createElement('div');
+            label.className = 'soh-course';
+            label.textContent = course;
+            ui.list.appendChild(label);
+
+            groups.get(course).sort((a, b) => b.start - a.start).forEach(p => {
+                const row = document.createElement('div');
+                row.className = 'soh-row';
+                const box = document.createElement('div');
+                const s1 = document.createElement('strong'); s1.textContent = p.title; s1.title = p.title;
+                const s2 = document.createElement('small'); s2.textContent = p.due ? 'Due ' + p.due : 'No due date';
+                box.append(s1, s2);
+                const btn = document.createElement('button');
+                btn.type = 'button'; btn.className = 'soh-restore';
+                btn.dataset.restore = p.key;
+                btn.innerHTML = ICON_RESTORE + '<span>Restore</span>';
+                row.append(box, btn);
+                ui.list.appendChild(row);
+            });
+        });
+    }
+
+    function refreshUI() {
+        if (!panel) return;
+        const n = hidden.size;
+        ui.count.textContent = n;
+        ui.restoreAll.textContent = n ? 'Restore all (' + n + ')' : 'Nothing to restore';
+        ui.restoreAll.disabled = !n;
+        corner.textContent = n + ' hidden';
+        corner.classList.toggle('show', !!settings.corner && n > 0 && !panel.classList.contains('open'));
+        renderList();
+    }
+
+    function openPanel() {
+        panel.classList.add('open');
+        if (settings.x !== null) place(settings.x, settings.y);
+        renderList(true);
+        refreshUI();
+    }
+    function closePanel() { panel.classList.remove('open'); refreshUI(); }
+    function togglePanel() { panel.classList.contains('open') ? closePanel() : openPanel(); }
+
+    function place(x, y) {
+        const w = panel.offsetWidth || 360, h = panel.offsetHeight || 300;
+        x = Math.max(8, Math.min(x, window.innerWidth - w - 8));
+        y = Math.max(8, Math.min(y, window.innerHeight - h - 8));
+        panel.style.left = x + 'px';
+        panel.style.top = y + 'px';
+        panel.style.right = 'auto';
+        panel.style.bottom = 'auto';
+        settings.x = x; settings.y = y;
+    }
+
+    function setupDrag(handle) {
+        handle.addEventListener('pointerdown', e => {
+            if (e.button !== 0 || e.target.closest('button')) return;
+            const r = panel.getBoundingClientRect();
+            const dx = e.clientX - r.left, dy = e.clientY - r.top;
+            handle.setPointerCapture(e.pointerId);
+            const move = ev => place(ev.clientX - dx, ev.clientY - dy);
+            const up = () => {
+                handle.removeEventListener('pointermove', move);
+                handle.removeEventListener('pointerup', up);
+                saveSettings();
+            };
+            handle.addEventListener('pointermove', move);
+            handle.addEventListener('pointerup', up);
+        });
+    }
+
+    // ================= hotkey: / . , (together, or one after another) =================
+    // This script only runs on schoology.com pages, so the hotkey does nothing elsewhere.
+    const COMBO = ['Slash', 'Period', 'Comma'];
+    const SEQ_WINDOW = 1500;
+    const held = new Set();
+    let seq = [];
+
+    const typingInField = () => {
+        const a = document.activeElement;
+        return !!a && (a.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+    };
+
+    window.addEventListener('keydown', e => {
+        if (!panel) return;
+        if (e.key === 'Escape' && panel.classList.contains('open')) { closePanel(); return; }
+        if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+        if (!COMBO.includes(e.code)) { seq = []; return; }
+
+        held.add(e.code);
+        const now = Date.now();
+        seq = seq.filter(s => now - s.time < SEQ_WINDOW);
+        seq.push({ code: e.code, time: now });
+        seq = seq.slice(-3);
+
+        const allHeld = COMBO.every(c => held.has(c));
+        const inOrder = seq.length === 3 && seq.every((s, i) => s.code === COMBO[i]);
+
+        if ((allHeld || inOrder) && !typingInField()) {
+            e.preventDefault();
+            held.clear();
+            seq = [];
+            togglePanel();
+        }
+    }, true);
+    window.addEventListener('keyup', e => { held.delete(e.code); }, true);
+    window.addEventListener('blur', () => { held.clear(); seq = []; });
+
+    // ================= start =================
+    function start() {
+        makePanel();
+        scan();
+        refreshUI();
+
+        // Schoology loads and refreshes its lists on its own (and the overdue popup too), so
+        // look again whenever new content appears. Saved hides are re-applied every time.
+        let queued = false;
+        new MutationObserver(muts => {
+            if (queued) return;
+            const relevant = muts.some(m => {
+                if (m.type !== 'childList') return false;
+                if (m.target.closest && m.target.closest('#soh-panel, #soh-toast, #soh-corner')) return false;
+                return [...m.addedNodes].some(n =>
+                    n.nodeType === 1 && !(n.classList && n.classList.contains('soh-btn')));
+            });
+            if (!relevant) return;
+            queued = true;
+            setTimeout(() => { queued = false; scan(); }, 200);
+        }).observe(document.body, { childList: true, subtree: true });
+
+        setInterval(scan, 2000);   // light safety net
+
+        // Keep other open Schoology tabs in sync.
+        window.addEventListener('storage', e => {
+            if (e.key !== STORE) return;
+            hidden = loadHidden();
+            rebuildIndex();
+            applyAll();
+        });
+    }
+
+    if (document.body) start();
+    else document.addEventListener('DOMContentLoaded', start);
+})();
+
